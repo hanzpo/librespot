@@ -934,6 +934,25 @@ impl PlayerTrackLoader {
         )
     }
 
+    /// Whether a file begins the way an unencrypted Ogg, MP3, FLAC or MP4
+    /// file does, leaving it at its start.
+    fn starts_as_audio<T: Read + Seek>(file: &mut T) -> bool {
+        let mut head = [0u8; 12];
+        let read = file.read_exact(&mut head).is_ok();
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return false;
+        }
+        read && Self::is_audio_header(&head)
+    }
+
+    fn is_audio_header(head: &[u8; 12]) -> bool {
+        head.starts_with(b"OggS")
+            || head.starts_with(b"ID3")
+            || head.starts_with(b"fLaC")
+            || &head[4..8] == b"ftyp"
+            || (head[0] == 0xFF && head[1] & 0xE0 == 0xE0)
+    }
+
     async fn find_available_alternative(&self, audio_item: AudioItem) -> Option<AudioItem> {
         if let Err(e) = audio_item.availability {
             error!("Track is unavailable: {e}");
@@ -1097,7 +1116,7 @@ impl PlayerTrackLoader {
         loop {
             let encrypted_file = AudioFile::open(&self.session, file_id, bytes_per_second);
 
-            let encrypted_file = match encrypted_file.await {
+            let mut encrypted_file = match encrypted_file.await {
                 Ok(encrypted_file) => encrypted_file,
                 Err(e) => {
                     error!("Unable to load encrypted file: {e:?}");
@@ -1123,6 +1142,15 @@ impl PlayerTrackLoader {
                         (None, unavailable)
                     }
                 };
+
+            // Without a key, only a file that starts as plain audio can be
+            // decoded. An encrypted file reads as noise, and the decoder can
+            // spend minutes searching all of it for a frame while the player
+            // takes no other command.
+            if key.is_none() && !Self::starts_as_audio(&mut encrypted_file) {
+                error!("Audio file is encrypted and its key is unavailable");
+                return Err(LoadError::after_decoder_failure(audio_key_unavailable));
+            }
 
             let mut decrypted_file = AudioDecrypt::new(key, encrypted_file);
 
@@ -2711,6 +2739,33 @@ where
 mod tests {
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
+
+    #[test]
+    fn only_a_plain_audio_file_is_read_without_its_key() {
+        use std::io::{Cursor, Read};
+
+        let mp4 = *b"\0\0\0\x20ftypM4A ";
+        for plain in [
+            &b"OggS\0\x02rest of page"[..],
+            b"ID3\x04\0\0 rest of tag",
+            b"fLaC\0\0\0\x22streaminfo",
+            b"\xFF\xFB\x90\x64 mp3 frame",
+            &mp4,
+        ] {
+            let mut file = Cursor::new(plain.to_vec());
+            assert!(PlayerTrackLoader::starts_as_audio(&mut file));
+            let mut first = [0u8; 4];
+            file.read_exact(&mut first).unwrap();
+            assert_eq!(first, plain[..4]);
+        }
+        for encrypted in [
+            &b"\x8a\x13\xc7\x02\x99\x41\x0e\xd5\x6b\x20\x77\x3f"[..],
+            b"OggS",
+        ] {
+            let mut file = Cursor::new(encrypted.to_vec());
+            assert!(!PlayerTrackLoader::starts_as_audio(&mut file));
+        }
+    }
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {

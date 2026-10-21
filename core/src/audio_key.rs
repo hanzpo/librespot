@@ -87,15 +87,30 @@ impl AudioKeyManager {
             seq
         });
 
-        self.send_key_request(seq, track, file)?;
-        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
-        match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
-            Err(_) => {
-                error!("Audio key response timeout");
-                Err(AudioKeyError::Timeout.into())
+        // A slow access point can take longer than the first wait to answer,
+        // so the request is sent again under the same sequence number and
+        // whichever reply arrives first is used.
+        const KEY_RESPONSE_TIMEOUTS: [Duration; 3] = [
+            Duration::from_millis(1500),
+            Duration::from_millis(3000),
+            Duration::from_millis(4500),
+        ];
+        let mut rx = rx;
+        for (attempt, timeout) in KEY_RESPONSE_TIMEOUTS.into_iter().enumerate() {
+            if attempt > 0 {
+                warn!("Audio key response timeout, requesting it again");
             }
-            Ok(k) => k?,
+            if let Err(e) = self.send_key_request(seq, track, file) {
+                self.lock(|inner| inner.pending.remove(&seq));
+                return Err(e);
+            }
+            if let Ok(k) = tokio::time::timeout(timeout, &mut rx).await {
+                return k?;
+            }
         }
+        self.lock(|inner| inner.pending.remove(&seq));
+        error!("Audio key response timeout");
+        Err(AudioKeyError::Timeout.into())
     }
 
     fn send_key_request(&self, seq: u32, track: SpotifyId, file: FileId) -> Result<(), Error> {
